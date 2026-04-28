@@ -1,20 +1,25 @@
-# Local Video Transcriber - 100% Offline
+# Local Video Transcriber - 100% Offline (Pro)
 
-Transcribe videos to text locally using Whisper AI. No internet needed (after first model download).
+Transcribe, translate, and summarize videos locally using Whisper AI and Qwen LLM. No data ever leaves your machine.
+
+## ✨ New in v5
+- **AI Refinement**: Fixes grammar and spelling using a tiny local LLM (Qwen-0.5B).
+- **AI Summarization**: Automatically generates bullet-point takeaways.
+- **Subtitles (.srt)**: Generates standard subtitle files for your videos.
+- **Translation**: Translate any foreign language audio directly into English.
+- **Security**: Filename sanitization and local-only execution.
 
 ## Features
 - Multi-file batch upload (drag & drop multiple videos)
 - Models: tiny, base, small, medium, large-v3
-- Auto language detection (English, Hindi, Telugu, etc.)
+- Auto language detection
 - Real-time progress with speed and ETA
-- Cancel button to stop anytime
-- Transcript saved as .txt automatically
 - 100% private - nothing leaves your machine
 
 ## Prerequisites
 1. **Python 3.11+**
 2. **ffmpeg** - must be on system PATH
-   - Download: https://ffmpeg.org/download.html
+   - Download: [ffmpeg.org](https://ffmpeg.org/download.html)
    - Add `bin/` folder to Windows PATH
 
 ## Setup & Run
@@ -25,10 +30,13 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Opens automatically at: http://127.0.0.1:7860
+Opens automatically at: `http://127.0.0.1:7860`
 
 ## Output
-Transcripts are saved to: `d:\audio trastipn\transcriptions\`
+Files are saved to: `d:\audio trastipn\transcriptions\`
+- `_transcript.txt`: Plain text transcript.
+- `.srt`: Subtitle file.
+- `_summary.txt`: AI-generated summary (if enabled).
 
 ## Models
 | Model | Speed | Quality | Size | Best For |
@@ -39,4 +47,4 @@ Transcripts are saved to: `d:\audio trastipn\transcriptions\`
 | medium | Fast | Excellent | ~769 MB | Good balance |
 | large-v3 | Slow | Best | ~1.5 GB | Hindi/Telugu |
 
-First run downloads the selected model automatically.
+_Note: AI Refinement uses the Qwen-0.5B model (~900MB), downloaded automatically on first use._

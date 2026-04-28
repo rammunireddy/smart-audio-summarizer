@@ -13,6 +13,7 @@ Features:
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -44,6 +45,40 @@ SUPPORTED = [
 # ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# HELPERS & SECURITY
+# ---------------------------------------------------------------------------
+
+def sanitize_filename(name: str) -> str:
+    """Security: Remove potentially dangerous characters from filenames."""
+    # Keep only alphanumeric, underscores, and dashes
+    name = Path(name).stem
+    name = re.sub(r"[^\w\s-]", "", name).strip()
+    name = re.sub(r"[-\s]+", "_", name)
+    return name
+
+
+def get_srt_timestamp(seconds: float) -> str:
+    """Convert seconds to SRT timestamp format: HH:MM:SS,mmm"""
+    td = seconds
+    hours = int(td // 3600)
+    minutes = int((td % 3600) // 60)
+    secs = int(td % 60)
+    milliseconds = int((td % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
+
+
+def format_as_srt(segments) -> str:
+    """Format Whisper segments into a standard .srt file content."""
+    srt_lines = []
+    for i, seg in enumerate(segments, 1):
+        if seg.text.strip():
+            start = get_srt_timestamp(seg.start)
+            end = get_srt_timestamp(seg.end)
+            srt_lines.append(f"{i}\n{start} --> {end}\n{seg.text.strip()}\n")
+    return "\n".join(srt_lines)
+
 
 def check_ffmpeg() -> bool:
     try:
@@ -96,15 +131,130 @@ def get_video_path(video_file) -> str:
 
 
 # ---------------------------------------------------------------------------
+# GLOBAL CACHE
+# ---------------------------------------------------------------------------
+
+CURRENT_MODEL = None
+CURRENT_MODEL_PARAMS = None
+CURRENT_REFINER = None
+
+def get_model(model_size: str):
+    """Load model once and cache it. Reloads only if settings change."""
+    global CURRENT_MODEL, CURRENT_MODEL_PARAMS
+    import torch
+    import gc
+
+    if torch.cuda.is_available():
+        device, compute_type = "cuda", "float16"
+    else:
+        device, compute_type = "cpu", "int8"
+
+    params = (model_size, device, compute_type)
+
+    if CURRENT_MODEL is None or CURRENT_MODEL_PARAMS != params:
+        # Free up memory before loading new model
+        CURRENT_MODEL = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        CURRENT_MODEL = WhisperModel(model_size, device=device, compute_type=compute_type)
+        CURRENT_MODEL_PARAMS = params
+
+    return CURRENT_MODEL, device
+
+
+def get_refiner_model():
+    """Load a tiny LLM (Qwen 0.5B) for text refinement."""
+    global CURRENT_REFINER
+    if CURRENT_REFINER is not None:
+        return CURRENT_REFINER
+
+    from transformers import pipeline
+    import torch
+
+    # Use GPU if available, otherwise CPU
+    device = 0 if torch.cuda.is_available() else -1
+    model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+    
+    try:
+        CURRENT_REFINER = pipeline(
+            "text-generation",
+            model=model_id,
+            device=device,
+            torch_dtype="auto",
+        )
+    except Exception as e:
+        print(f"Refiner Load Error: {e}")
+        return None
+    
+    return CURRENT_REFINER
+
+
+def _run_llm_task(pipe, text: str, mode: str = "refine") -> str:
+    """Internal helper to run the LLM with specific parameters to prevent looping."""
+    if mode == "summarize":
+        system_msg = "You are a professional secretary. Summarize the following transcript into a main title and 5-7 concise bullet points. Focus on the main goal, key actions, and results. Return ONLY the summary."
+    elif mode == "summarize_partial":
+        system_msg = "You are an assistant. Extract the 3-5 most important points from this section of a transcript. Be extremely brief. Return ONLY the points."
+    elif mode == "summarize_final":
+        system_msg = "You are a professional secretary. Combine the following partial summaries into one cohesive final summary with a Title and 5-10 bullet points. Return ONLY the final summary."
+    else:
+        system_msg = "You are a professional editor. Clean up the following transcript by fixing grammar, spelling, and punctuation. Maintain the original language and meaning. Remove filler words. Return ONLY the corrected text."
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": f"Text:\n{text}"},
+    ]
+    
+    prompt = pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    # Small models like Qwen-0.5B NEED repetition_penalty and a bit of temperature
+    outputs = pipe(
+        prompt,
+        max_new_tokens=200 if mode == "summarize_partial" else (600 if "summarize" in mode else max(len(text.split()), 100) + 50),
+        do_sample=True,
+        temperature=0.1,
+        repetition_penalty=1.2,
+        pad_token_id=pipe.tokenizer.eos_token_id,
+    )
+    
+    # Extract response after the assistant prompt
+    result = outputs[0]["generated_text"].split("assistant\n")[-1].strip()
+    return result
+
+
+def refine_text(text: str, mode: str = "refine") -> str:
+    """Uses a tiny LLM to clean up or summarize the transcript with chunking support."""
+    pipe = get_refiner_model()
+    if not pipe:
+        return text
+    
+    # Chunking logic for long transcripts (0.5B models struggle with > 2000 words)
+    words = text.split()
+    chunk_size = 2000
+    
+    if mode == "summarize" and len(words) > chunk_size:
+        chunks = [" ".join(words[i : i + chunk_size]) for i in range(0, len(words), chunk_size)]
+        partial_summaries = []
+        for chunk in chunks:
+            partial = _run_llm_task(pipe, chunk, mode="summarize_partial")
+            partial_summaries.append(partial)
+        
+        combined_summaries = "\n".join(partial_summaries)
+        return _run_llm_task(pipe, combined_summaries, mode="summarize_final")
+    
+    return _run_llm_task(pipe, text, mode=mode)
+
+
+# ---------------------------------------------------------------------------
 # CORE TRANSCRIPTION PIPELINE
 # ---------------------------------------------------------------------------
 
-def transcribe_batch(video_files, model_size: str, progress=gr.Progress()):
+def transcribe_batch(video_files, model_size: str, do_refine: bool, do_summary: bool, do_translate: bool, progress=gr.Progress()):
     """
-    Batch pipeline: validate all files -> load model ONCE -> loop files
-    sequentially.  Each file: extract audio -> transcribe (streaming
-    per-segment progress) -> save .txt.
-    A combined .txt is created when >1 file is uploaded.
+    Batch pipeline: validate all files -> load models -> loop files
+    sequentially. Each file: extract audio -> transcribe/translate -> refine -> summary -> save .txt/.srt.
     """
     tmp_dirs = []
     wall_start = time.time()
@@ -124,35 +274,28 @@ def transcribe_batch(video_files, model_size: str, progress=gr.Progress()):
         for p in paths:
             ext = Path(p).suffix.lower()
             if ext not in SUPPORTED:
-                raise gr.Error(
-                    f"Unsupported format '{ext}' in {Path(p).name}"
-                )
+                raise gr.Error(f"Unsupported format '{ext}' in {Path(p).name}")
 
         if not check_ffmpeg():
-            raise gr.Error(
-                "ffmpeg not found on PATH.\n"
-                "Download: https://ffmpeg.org/download.html"
-            )
+            raise gr.Error("ffmpeg not found on PATH.")
 
         total_files = len(paths)
-        progress(
-            0.02,
-            desc=f"[1/4] {total_files} file(s) queued - loading Whisper model..."
-        )
+        progress(0.02, desc="[1/5] Preparing Whisper model...")
 
-        # -- 1. Load model ONCE for all files ----------------------------------
-        import torch
-        if torch.cuda.is_available():
-            device, compute_type = "cuda", "float16"
-        else:
-            device, compute_type = "cpu", "int8"
-        model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        progress(0.08, desc=f"Model ready! (Using {device.upper()}) Starting batch...")
+        # -- 1. Load Whisper ---------------------------------------------------
+        model, device = get_model(model_size)
+        
+        # -- 2. Pre-load Refiner if needed -------------------------------------
+        if do_refine or do_summary:
+            progress(0.05, desc="[2/5] Preparing AI Refiner model...")
+            get_refiner_model()
 
-        all_results = []   # (filename, transcript_text, elapsed, info, segs)
+        progress(0.08, desc=f"Models ready! (Using {device.upper()}) Starting batch...")
+
+        all_results = []   # (filename, transcript_text, summary, elapsed, info)
         saved_paths = []
 
-        # -- 2. Process each file ----------------------------------------------
+        # -- 3. Process each file ----------------------------------------------
         BAND_START = 0.08
         BAND_END   = 0.92
         band_size  = (BAND_END - BAND_START) / total_files
@@ -168,27 +311,22 @@ def transcribe_batch(video_files, model_size: str, progress=gr.Progress()):
             tmp_dirs.append(tmp_dir)
             wav_path = os.path.join(tmp_dir, "audio.wav")
             extract_audio(video_path, wav_path)
-            progress(
-                f_base + band_size * 0.15,
-                desc=f"{file_label} - audio ready, transcribing..."
-            )
 
-            # -- Transcribe (streaming) ----------------------------------------
+            # -- Transcribe/Translate ------------------------------------------
             t0 = time.time()
+            task_type = "translate" if do_translate else "transcribe"
             segments_gen, info = model.transcribe(
                 wav_path,
                 beam_size=5,
-                language=None,
-                task="transcribe",
+                task=task_type,
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
-                word_timestamps=False,
             )
 
             total_dur = info.duration or 0
             segments  = []
-            SEG_START = f_base + band_size * 0.15
-            SEG_END   = f_base + band_size * 0.95
+            SEG_START = f_base + band_size * 0.1
+            SEG_END   = f_base + band_size * 0.7
 
             for segment in segments_gen:
                 segments.append(segment)
@@ -198,50 +336,66 @@ def transcribe_batch(video_files, model_size: str, progress=gr.Progress()):
                 else:
                     prog_val = SEG_START
 
-                elapsed   = time.time() - t0
-                speed     = segment.end / elapsed if elapsed > 0 else 1.0
-                remaining = (
-                    (total_dur - segment.end) / speed if speed > 0 else 0
-                )
-                pos_str = (
-                    f"{int(segment.end // 60)}m{int(segment.end % 60):02d}s"
-                )
-                dur_str = (
-                    f"{int(total_dur // 60)}m{int(total_dur % 60):02d}s"
-                )
-                eta_str = (
-                    f"~{int(remaining)}s left"
-                    if remaining > 0
-                    else "finishing..."
-                )
-                progress(
-                    prog_val,
-                    desc=(
-                        f"{file_label} - "
-                        f"{pos_str}/{dur_str}  |  {speed:.1f}x  |  {eta_str}"
-                    ),
-                )
+                elapsed_so_far = time.time() - t0
+                speed = segment.end / elapsed_so_far if elapsed_so_far > 0 else 1.0
+                progress(prog_val, desc=f"{file_label} - Hearing audio... ({speed:.1f}x)")
+
+            raw_transcript = " ".join([s.text.strip() for s in segments])
+            
+            # -- AI Refinement -------------------------------------------------
+            final_text = raw_transcript
+            if do_refine:
+                progress(f_base + band_size * 0.75, desc=f"{file_label} - ✨ Polishing text...")
+                final_text = refine_text(raw_transcript, mode="refine")
+            
+            # -- AI Summary ----------------------------------------------------
+            summary_text = ""
+            if do_summary:
+                progress(f_base + band_size * 0.85, desc=f"{file_label} - 📝 Writing summary...")
+                # Use final_text (refined) if available to speed up summary
+                summary_text = refine_text(final_text, mode="summarize")
+
+            # -- Generate SRT --------------------------------------------------
+            srt_content = format_as_srt(segments)
 
             elapsed_file = time.time() - t0
 
-            # -- Build & save transcript ---------------------------------------
-            transcript_lines = []
-            for seg in segments:
-                if seg.text.strip():
-                    start_str = f"{int(seg.start // 3600):02d}:{int((seg.start % 3600) // 60):02d}:{int(seg.start % 60):02d}.{int((seg.start % 1) * 1000):03d}"
-                    end_str = f"{int(seg.end // 3600):02d}:{int((seg.end % 3600) // 60):02d}:{int(seg.end % 60):02d}.{int((seg.end % 1) * 1000):03d}"
-                    transcript_lines.append(f"[{start_str} --> {end_str}] {seg.text.strip()}")
+            # -- Save Files (Security: Sanitize names) -------------------------
+            safe_name = sanitize_filename(fname)
             
-            transcript_text = "\n".join(transcript_lines)
-            stem     = Path(video_path).stem
-            txt_path = OUTPUT_DIR / f"{stem}_transcript.txt"
-            txt_path.write_text(transcript_text, encoding="utf-8")
+            txt_path = OUTPUT_DIR / f"{safe_name}_transcript.txt"
+            txt_path.write_text(final_text, encoding="utf-8")
+            
+            srt_path = OUTPUT_DIR / f"{safe_name}.srt"
+            srt_path.write_text(srt_content, encoding="utf-8")
+            
+            if summary_text:
+                sum_path = OUTPUT_DIR / f"{safe_name}_summary.txt"
+                sum_path.write_text(summary_text, encoding="utf-8")
+
             saved_paths.append(txt_path)
-            all_results.append(
-                (fname, transcript_text, elapsed_file, info, len(segments))
-            )
+            all_results.append((fname, final_text, summary_text, elapsed_file, info))
 
             progress(f_base + band_size, desc=f"{file_label} done!")
+
+        progress(0.93, desc="Wrapping up...")
+
+        # -- 4. Combined Result for UI -----------------------------------------
+        full_display = ""
+        for fn, txt, summary, *_ in all_results:
+            full_display += f"=== {fn} ===\n"
+            if summary:
+                full_display += f"SUMMARY:\n{summary}\n\n"
+            full_display += f"TRANSCRIPT:\n{txt}\n\n" + ("="*40) + "\n\n"
+
+        result_md = f"### {total_files} file(s) processed!\nFiles saved in: `{OUTPUT_DIR}`"
+        
+        return (
+            result_md,
+            f"Transcripts, Subtitles, and Summaries saved to `{OUTPUT_DIR}`.",
+            full_display,
+            gr.update(value=str(saved_paths[0]), visible=True),
+        )
 
         progress(0.93, desc="Wrapping up...")
 
@@ -380,15 +534,15 @@ button.lg.primary:hover {
     background: #0f172a;
     border: 1px solid #1e3a5f;
     border-radius: 12px;
-    padding: 16px;
-    margin-top: 8px;
+    padding: 24px 16px 16px 16px;
+    margin-top: 12px;
 }
 .save-box {
     background: #0f2a1a;
     border: 1px solid #14532d;
     border-radius: 12px;
-    padding: 16px;
-    margin-top: 8px;
+    padding: 24px 16px 16px 16px;
+    margin-top: 12px;
 }
 .tab-nav button {
     font-size: 15px !important;
@@ -419,9 +573,9 @@ th { background: #1e293b; color: #93c5fd; }
 HERO_HTML = """
 <div class="hero">
   <h1>Local Video Transcriber</h1>
-  <p>100% Offline  |  Powered by Whisper AI  |  No data leaves your machine</p>
+  <p>100% Offline  |  Powered by Whisper AI + Qwen LLM  |  No data leaves your machine</p>
   <span class="badge" style="background:#1e3a5f;color:#60a5fa;">faster-whisper</span>
-  <span class="badge" style="background:#14532d;color:#34d399;">CPU / GPU</span>
+  <span class="badge" style="background:#14532d;color:#34d399;">Qwen-0.5B AI</span>
   <span class="badge" style="background:#3b0764;color:#a78bfa;">Auto Language</span>
   <span class="badge" style="background:#450a0a;color:#f87171;">100% Private</span>
 </div>
@@ -458,10 +612,10 @@ def build_ui():
                         gr.Markdown("### Select Your Video(s)")
                         video_input = gr.File(
                             label=(
-                                "Drop a folder with videos here "
-                                "- or click to browse"
+                                "Select one or more videos "
+                                "- or drag them here"
                             ),
-                            file_count="directory",
+                            file_count="multiple",
                             file_types=SUPPORTED,
                         )
 
@@ -475,6 +629,22 @@ def build_ui():
                             ],
                             value="large-v3",
                         )
+                        with gr.Group():
+                            do_refine = gr.Checkbox(
+                                label="✨ AI Refine (Fix Grammar/Spelling)",
+                                value=False,
+                                info="Polishes text using Qwen-0.5B."
+                            )
+                            do_summary = gr.Checkbox(
+                                label="📝 AI Summary",
+                                value=False,
+                                info="Generates bullet-point takeaways."
+                            )
+                            do_translate = gr.Checkbox(
+                                label="🌍 Translate to English",
+                                value=False,
+                                info="Converts any language into English."
+                            )
                         gr.Markdown(
                             "| Model | Speed | Quality | Size |\n"
                             "|-------|-------|---------|------|\n"
@@ -560,14 +730,14 @@ def build_ui():
         )
 
         # -- Event handler -----------------------------------------------------
-        def on_click(video_files, model_size, progress=gr.Progress()):
+        def on_click(video_files, model_size, do_refine, do_summary, do_translate, progress=gr.Progress()):
             if video_files is None:
                 raise gr.Error("Please upload at least one video file.")
-            return transcribe_batch(video_files, model_size, progress)
+            return transcribe_batch(video_files, model_size, do_refine, do_summary, do_translate, progress)
 
         click_event = transcribe_btn.click(
             fn=on_click,
-            inputs=[video_input, model_selector],
+            inputs=[video_input, model_selector, do_refine, do_summary, do_translate],
             outputs=[
                 result_info,
                 save_info,
