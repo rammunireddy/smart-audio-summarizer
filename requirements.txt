@@ -1,0 +1,5 @@
+gradio>=6.0.0
+faster-whisper>=1.0.0
+torch --index-url https://download.pytorch.org/whl/cpu
+transformers
+accelerate
