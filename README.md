@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # Local Video Transcriber - 100% Offline (Pro)
 
 Transcribe, translate, and summarize videos locally using Whisper AI and Qwen LLM. No data ever leaves your machine.
@@ -26,7 +26,7 @@ Transcribe, translate, and summarize videos locally using Whisper AI and Qwen LL
 ## Setup & Run
 
 ```bash
-cd "d:\audio trastipn"
+cd "\smart-audio-summarizer
 pip install -r requirements.txt
 python app.py
 ```
@@ -34,7 +34,7 @@ python app.py
 Opens automatically at: `http://127.0.0.1:7860`
 
 ## Output
-Files are saved to: `d:\audio trastipn\transcriptions\`
+Files are saved to: `\transcriptions\`
 - `_transcript.txt`: Plain text transcript.
 - `.srt`: Subtitle file.
 - `_summary.txt`: AI-generated summary (if enabled).
