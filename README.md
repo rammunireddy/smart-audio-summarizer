@@ -3,6 +3,9 @@
 
 Transcribe, translate, and summarize videos locally using Whisper AI and Qwen LLM. No data ever leaves your machine.
 
+![App Screenshot](app_ui.png)
+
+
 ## ✨ New in v5
 - **AI Refinement**: Fixes grammar and spelling using a tiny local LLM (Qwen-0.5B).
 - **AI Summarization**: Automatically generates bullet-point takeaways.
@@ -49,7 +52,3 @@ Files are saved to: `\transcriptions\`
 | large-v3 | Slow | Best | ~1.5 GB | Hindi/Telugu |
 
 _Note: AI Refinement uses the Qwen-0.5B model (~900MB), downloaded automatically on first use._
-=======
-# smart-audio-summarizer
-Local AI Transcriber &amp; Summarizer A 100% offline, privacy-first tool to transcribe videos and generate AI summaries. Powered by faster-whisper for high-speed transcription and Qwen-0.5B for intelligent summarization and grammar refinement. No data ever leaves your machine.
->>>>>>> a810f2fe5b2f5411deb057624bb785782304eccd
