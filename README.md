@@ -3,10 +3,12 @@
 
 Transcribe, translate, and summarize videos locally using Whisper AI and Qwen LLM. No data ever leaves your machine.
 
-![App Screenshot](app_ui.png)
+<p align="center">
+  <img src="app_ui.png" width="800" title="App Interface">
+</p>
 
 
-## ✨ New in v5
+## ✨ Key Features
 - **AI Refinement**: Fixes grammar and spelling using a tiny local LLM (Qwen-0.5B).
 - **AI Summarization**: Automatically generates bullet-point takeaways.
 - **Subtitles (.srt)**: Generates standard subtitle files for your videos.
